@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+from collections import defaultdict
 from fractions import Fraction
 import tempfile
+import time
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 import cv2
@@ -198,6 +200,54 @@ def process_images(args: argparse.Namespace, paths: list[Path]) -> None:
             str(out_path), output), f'Failed to write image "{out_path}".'
 
 
+@torch.no_grad()
+def upscale_video_batch(upsampler: RealESRGANer, frames: list, outscale: float, timings: dict = None):
+    def checkpoint(label, start):
+        if timings is not None:
+            if upsampler.device.type == 'mps':
+                torch.mps.synchronize()
+            elif upsampler.device.type == 'cuda':
+                torch.cuda.synchronize(upsampler.device)
+            timings[label] = time.perf_counter() - start
+
+
+    if len(frames) == 1:
+        begin = time.perf_counter()
+        result = [upsampler.enhance(frames[0], outscale=outscale)[0]]
+        checkpoint('upscale_total', begin)
+        return result
+
+    begin = time.perf_counter()
+    tensors = []
+    for frame in frames:
+        rgb = cv2.cvtColor(frame.astype(np.float32) / 255.0,
+                           cv2.COLOR_BGR2RGB)
+        upsampler.pre_process(rgb)
+        tensors.append(upsampler.img)
+    upsampler.img = torch.cat(tensors, dim=0)
+    checkpoint('prepare', begin)
+    begin = time.perf_counter()
+    if upsampler.tile_size > 0:
+        upsampler.tile_process()
+    else:
+        upsampler.process()
+    checkpoint('model', begin)
+    begin = time.perf_counter()
+    result = upsampler.post_process().float().cpu().clamp_(0, 1).numpy()
+    result = result[:, [2, 1, 0], :, :].transpose(0, 2, 3, 1)
+    height, width = frames[0].shape[:2]
+    output = []
+    for image in result:
+        image = (image * 255.0).round().astype(np.uint8)
+        if outscale != float(upsampler.scale):
+            image = cv2.resize(image,
+                               (int(width * outscale), int(height * outscale)),
+                               interpolation=cv2.INTER_LANCZOS4)
+        output.append(image)
+    checkpoint('postprocess', begin)
+    return output
+
+
 def process_video_worker(args: argparse.Namespace, source_path: Path,
                          output_path: Path, device: torch.device) -> None:
     print(
@@ -214,15 +264,54 @@ def process_video_worker(args: argparse.Namespace, source_path: Path,
         reader.fps,
         reader.audio_source)
     try:
+        profile_total = defaultdict(float)
+        profiled_frames = 0
         with tqdm(total=reader.count, unit='frame', desc=str(device)) as progress:
             while True:
-                image = reader.read()
-                if image is None:
+                start = time.perf_counter()
+                frames = []
+                for _ in range(args.batch_size):
+                    frame = reader.read()
+                    if frame is None:
+                        break
+                    frames.append(frame)
+                if not frames:
                     break
-                frame, _ = upsampler.enhance(
-                    image, outscale=args.outscale, alpha_upsampler=args.alpha_upsampler)
-                writer.write(frame)
-                progress.update(1)
+                decode_seconds = time.perf_counter() - start
+
+                inputs = frames
+                if args.torch_compile and len(frames) < args.batch_size:
+                    inputs = frames + [frames[-1]] * (args.batch_size - len(frames))
+                stage_times = {} if args.profile else None
+                start = time.perf_counter()
+                enhanced = upscale_video_batch(upsampler, inputs, args.outscale, stage_times)
+                upscale_seconds = time.perf_counter() - start
+
+                start = time.perf_counter()
+                for frame in enhanced[:len(frames)]:
+                    writer.write(frame)
+                encode_seconds = time.perf_counter() - start
+                progress.update(len(frames))
+                if args.profile:
+                    profiled_frames += len(frames)
+                    profile_total['decode'] += decode_seconds
+                    profile_total['upscale'] += upscale_seconds
+                    profile_total['encode'] += encode_seconds
+                    for name, duration in stage_times.items():
+                        profile_total[name] += duration
+                    per_frame = lambda key: profile_total[key] / profiled_frames
+                    seconds = sum(profile_total[k] for k in ('decode', 'upscale', 'encode'))
+                    msg = (f'[profile] {profiled_frames} frames '
+                               f'{profiled_frames/seconds:.3f} fps; '
+                               f'decode={per_frame("decode"):.3f}s/frame, '
+                               f'upscale={per_frame("upscale"):.3f}s/frame, '
+                               f'write={per_frame("encode"):.3f}s/frame')
+                    if args.batch_size > 1:
+                        msg += (f' [prepare={per_frame("prepare"):.3f}, '
+                                f'model={per_frame("model"):.3f}, '
+                                f'post={per_frame("postprocess"):.3f}]')
+                    tqdm.write(msg)
+
     finally:
         try:
             reader.close()
@@ -244,6 +333,8 @@ def parse_args():
         '--alpha_upsampler',
         default='realesrgan',
         help='Alpha upsampler to use')
+    parser.add_argument('--batch_size', '--batch-size', type=int, default=1,
+                        help='Batch size for video processing')
     parser.add_argument('--compile_backend', choices=['inductor', 'eager', 'aot_eager'],
                         default='inductor')
     parser.add_argument('--compile_mode',
@@ -259,6 +350,7 @@ def parse_args():
     parser.add_argument('-n', '--model_name', default='RealESRGAN_x2plus')
     parser.add_argument('-o', '--output', default='results', help='Output directory')
     parser.add_argument('--pre_pad', type=int, default=0)
+    parser.add_argument('--profile', action='store_true', help='Enable profiling')
     parser.add_argument('-s', '--outscale', type=float, default=2.0)
     parser.add_argument('--suffix', default='out', help='Filename suffix')
     parser.add_argument('-t', '--tile', type=int, default=0)
